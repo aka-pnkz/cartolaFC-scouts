@@ -1,164 +1,240 @@
+# app.py
 import streamlit as st
 import pandas as pd
 import requests
+from utils.api import fetch_mercado, fetch_ligas_status
+from utils.score_mitada import enriquecer_df
+from utils.confrontos import get_confrontos_df
+from utils.alertas import gerar_alertas, resumo_alertas
 
-# Configuração da Página
-st.set_page_config(page_title="Mitar-Bot Cartola 2026", layout="wide", page_icon="⚽")
+st.set_page_config(
+    page_title="Cartola FC Analyzer 2026",
+    page_icon="⚽",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 
-# --- CAMADA DE DADOS (INGESTION) ---
-@st.cache_data(ttl=600) # Cache de 10 minutos
-def get_cartola_data():
-    try:
-        # API de Atletas e Mercado
-        mercado_url = "https://api.cartola.globo.com/atletas/mercado"
-        # API de Partidas
-        partidas_url = "https://api.cartola.globo.com/partidas"
-        
-        mercado_raw = requests.get(mercado_url).json()
-        partidas_raw = requests.get(partidas_url).json()
-        
-        return mercado_raw, partidas_raw
-    except Exception as e:
-        st.error(f"Erro ao conectar com a API do Cartola: {e}")
-        return None, None
+# ── CSS Dark Theme ────────────────────────────────────────────────
+st.markdown("""
+<style>
+body, .stApp { background-color: #0e1117; color: #fafafa; }
+.metric-card {
+    background: #1c1f26; border-radius: 10px;
+    padding: 16px; text-align: center;
+    border: 1px solid #2d3139; margin: 4px;
+}
+.metric-card h3 { font-size: 2rem; margin: 0; }
+.metric-card p  { color: #888; margin: 0; font-size: 0.85rem; }
+.alerta-danger  { background:#3d1010; border-left:4px solid #e63946;
+                  padding:8px 12px; border-radius:6px; margin:4px 0; }
+.alerta-warning { background:#3d2e10; border-left:4px solid #f4a261;
+                  padding:8px 12px; border-radius:6px; margin:4px 0; }
+.alerta-info    { background:#0d2137; border-left:4px solid #2196f3;
+                  padding:8px 12px; border-radius:6px; margin:4px 0; }
+table { width:100% !important; }
+</style>
+""", unsafe_allow_html=True)
 
-# --- CAMADA DE INTELIGÊNCIA (SCOUTING ENGINE) ---
-def process_data(mercado_raw, partidas_raw):
-    # Criar DataFrame de Atletas
-    atletas = mercado_raw['atletas']
-    clubes = mercado_raw['clubes']
-    posicoes = mercado_raw['posicoes']
-    df = pd.DataFrame(atletas)
-    
-    # Mapear Clubes e Posições
-    df['clube_nome'] = df['clube_id'].apply(lambda x: clubes[str(x)]['nome'])
-    df['pos_nome'] = df['posicao_id'].apply(lambda x: posicoes[str(x)]['abreviacao'].upper())
-    
-    # Criar lista de Mandantes para bônus
-    mandantes = [p['clube_casa_id'] for p in partidas_raw['partidas']]
-    df['mando'] = df['clube_id'].apply(lambda x: "🏠 Casa" if x in mandantes else "✈️ Fora")
-    
-    # --- LOGICA DE SCOUTING (PESOS PROFISSIONAIS) ---
-    # Extrair scouts individuais (preenchendo 0 se não existir)
-    def get_scout(s_dict, key):
-        return s_dict.get(key, 0) if isinstance(s_dict, dict) else 0
+# ── Sidebar ───────────────────────────────────────────────────────
+with st.sidebar:
+    st.image("https://s.glbimg.com/es/sde/f/2024/02/19/cartola-fc.png", width=160)
+    st.markdown("## ⚽ Cartola FC Analyzer")
+    st.markdown("**Rodada 10 — Temporada 2026**")
+    st.divider()
 
-    df['DS'] = df['scout'].apply(lambda x: get_scout(x, 'DS'))
-    df['G'] = df['scout'].apply(lambda x: get_scout(x, 'G'))
-    df['A'] = df['scout'].apply(lambda x: get_scout(x, 'A'))
-    df['DE'] = df['scout'].apply(lambda x: get_scout(x, 'DE'))
-    df['SG'] = df['scout'].apply(lambda x: get_scout(x, 'SG'))
-    df['FD'] = df['scout'].apply(lambda x: get_scout(x, 'FD'))
-    df['FF'] = df['scout'].apply(lambda x: get_scout(x, 'FF'))
+    orcamento = st.number_input(
+        "💰 Orçamento (C$)", min_value=0.0, max_value=200.0,
+        value=122.28, step=0.01, format="%.2f"
+    )
+    formacao = st.selectbox(
+        "📐 Formação", ["4-3-3","4-4-2","3-5-2","3-4-3","4-5-1","5-3-2","5-4-1"],
+        index=0
+    )
+    modo = st.selectbox(
+        "🎯 Modo", ["equilibrado","agressivo","defensivo","valorizacao"],
+        format_func=lambda x: {
+            "equilibrado": "⚖️ Equilibrado",
+            "agressivo":   "🔥 Agressivo",
+            "defensivo":   "🛡️ Defensivo",
+            "valorizacao": "📈 Valorização",
+        }[x]
+    )
+    apenas_provaveis = st.checkbox("✅ Apenas Prováveis", value=True)
+    variacao_pos     = st.checkbox("📈 Variação Positiva", value=True)
+    min_jogos        = st.slider("🎮 Mínimo de Jogos", 0, 10, 3)
 
-    # Cálculo de Score Técnico por Posição
-    def calc_score(row):
-        score = 0
-        if row['pos_nome'] == 'GOL':
-            score = (row['DE'] * 1.0) + (row['media_num'] * 2)
-        elif row['pos_nome'] in ['LAT', 'ZAG']:
-            score = (row['DS'] * 1.2) + (row['SG'] * 5.0) + (row['media_num'] * 1.5)
-        elif row['pos_nome'] == 'MEI':
-            score = (row['DS'] * 1.0) + (row['A'] * 5.0) + (row['media_num'] * 2)
-        elif row['pos_nome'] == 'ATA':
-            score = (row['G'] * 8.0) + (row['FD'] * 1.2) + (row['FF'] * 0.8) + (row['media_num'] * 2)
-        
-        # Bônus de Mando
-        if row['mando'] == "🏠 Casa":
-            score *= 1.15
-            
-        return round(score, 2)
+    st.divider()
+    if st.button("🔄 Atualizar Dados", use_container_width=True):
+        st.cache_data.clear()
+        st.rerun()
+    st.caption("Dados: api.cartola.globo.com")
 
-    df['score_mitada'] = df.apply(calc_score, axis=1)
-    return df, partidas_raw['partidas'], clubes
+# ── Carrega dados ─────────────────────────────────────────────────
+@st.cache_data(ttl=300)
+def carregar_dados():
+    data = fetch_mercado()
+    atletas_raw = list(data.get("atletas", {}).values())
+    clubes_raw  = data.get("clubes", {})
+    # Injeta abreviação do clube
+    for a in atletas_raw:
+        cid = str(a.get("clube_id", ""))
+        a["_clube_abrev"] = clubes_raw.get(cid, {}).get("abreviacao", cid)
+    return atletas_raw
 
-# --- INTERFACE STREAMLIT ---
-def main():
-    st.title("🚀 MITAR-BOT v2026")
-    st.markdown("---")
+atletas_raw = carregar_dados()
+df_full     = enriquecer_df(atletas_raw)
 
-    # Sidebar
-    st.sidebar.header("⚙️ Configurações")
-    saldo_disp = st.sidebar.number_input("Seu Saldo (Cartoletas):", value=122.28, step=1.0)
-    rodada_atual = st.sidebar.info("Análise para a Rodada Atual")
-    
-    mercado_raw, partidas_raw = get_cartola_data()
-    
-    if mercado_raw and partidas_raw:
-        df, partidas, clubes_map = process_data(mercado_raw, partidas_raw)
-        
-        # 1. Tabela de Confrontos
-        with st.expander("🏟️ Confrontos da Rodada"):
-            cols_p = st.columns(2)
-            for i, p in enumerate(partidas):
-                casa = clubes_map[str(p['clube_casa_id'])]['nome']
-                fora = clubes_map[str(p['clube_visitante_id'])]['nome']
-                target_col = cols_p[0] if i < 5 else cols_p[1]
-                target_col.write(f"**{casa}** x **{fora}**")
+# ── Filtros ───────────────────────────────────────────────────────
+df = df_full.copy()
+if apenas_provaveis:
+    df = df[df["status_id"].isin([1, 7])]
+if variacao_pos:
+    df = df[df["variacao_num"] >= 0]
+if min_jogos > 0:
+    df = df[df["jogos_num"] >= min_jogos]
 
-        # 2. Algoritmo de Escalação (Otimizador Simples)
-        # Filtrar Apenas Prováveis
-        df_prov = df[df['status_id'] == 7].sort_values('score_mitada', ascending=False)
-        
-        # Seleção de Elenco (Esquema 4-3-3 padrão)
-        def escalar_time(df_pool, orcamento):
-            time = []
-            custo = 0
-            config = {'GOL': 1, 'LAT': 2, 'ZAG': 2, 'MEI': 3, 'ATA': 3, 'TEC': 1}
-            
-            for pos, qtd in config.items():
-                candidatos = df_pool[df_pool['pos_nome'] == pos].head(qtd)
-                for _, row in candidatos.iterrows():
-                    time.append(row)
-                    custo += row['preco_num']
-            
-            # Ajuste de Orçamento (Se estourar, busca substitutos mais baratos)
-            while custo > orcamento:
-                # Localiza o mais caro e troca pelo próximo da lista de candidatos mais barato
-                time.sort(key=lambda x: x['preco_num'], reverse=True)
-                removido = time.pop(0)
-                custo -= removido['preco_num']
-                
-                substituto = df_pool[(df_pool['pos_nome'] == removido['pos_nome']) & 
-                                     (~df_pool['atleta_id'].isin([t['atleta_id'] for t in time])) &
-                                     (df_pool['preco_num'] < removido['preco_num'])].head(1)
-                
-                if not substituto.empty:
-                    time.append(substituto.iloc[0])
-                    custo += substituto.iloc[0]['preco_num']
-                else:
-                    # Fallback caso não ache substituto (não deve ocorrer com pool grande)
-                    time.append(removido)
-                    custo += removido['preco_num']
-                    break
-            
-            return pd.DataFrame(time), custo
+# ── Header ────────────────────────────────────────────────────────
+st.markdown("# ⚽ Cartola FC Analyzer — Rodada 10")
+st.markdown(f"**Mercado:** {'🟢 Aberto' if True else '🔴 Fechado'} &nbsp;|&nbsp; "
+            f"**Jogadores filtrados:** {len(df)} &nbsp;|&nbsp; "
+            f"**Orçamento:** C$ {orcamento:.2f}")
+st.divider()
 
-        time_ideal, custo_final = escalar_time(df_prov, saldo_disp)
+# ── KPIs ──────────────────────────────────────────────────────────
+col1, col2, col3, col4, col5 = st.columns(5)
+kpis = [
+    (col1, "🏆 Top Score Mitada", f"{df['Score Mitada'].max():.3f}" if not df.empty else "N/A"),
+    (col2, "📊 Maior Média",      f"{df['Média'].max():.1f} pts"    if not df.empty else "N/A"),
+    (col3, "💰 Mais Barato",      f"C$ {df['Preço'].min():.2f}"     if not df.empty else "N/A"),
+    (col4, "📈 Maior Variação",   f"C$ {df['Variação'].max():+.2f}" if not df.empty else "N/A"),
+    (col5, "✅ Prováveis",        str(len(df[df["status_id"].isin([1,7])]))),
+]
+for col, label, valor in kpis:
+    with col:
+        st.markdown(f"""
+        <div class="metric-card">
+            <p>{label}</p>
+            <h3>{valor}</h3>
+        </div>""", unsafe_allow_html=True)
 
-        # Exibição do Time
-        st.subheader(f"✅ Time Sugerido (Custo: C$ {custo_final:.2f})")
-        st.dataframe(time_ideal[['pos_nome', 'apelido', 'clube_nome', 'mando', 'media_num', 'preco_num', 'score_mitada']], 
-                     use_container_width=True)
-        
-        # Destaque do Capitão
-        capitao = time_ideal.sort_values('score_mitada', ascending=False).iloc[0]
-        st.success(f"💎 **Capitão Recomendado:** {capitao['apelido']} ({capitao['clube_nome']})")
+st.divider()
 
-        # 3. Banco de Reservas
-        st.subheader("🔄 Sugestão de Banco")
-        reservas = []
-        for pos in ['GOL', 'LAT', 'ZAG', 'MEI', 'ATA']:
-            # Pega o titular mais barato da posição
-            min_preco_titular = time_ideal[time_ideal['pos_nome'] == pos]['preco_num'].min()
-            # Busca reserva mais barato que o titular
-            res = df_prov[(df_prov['pos_nome'] == pos) & 
-                          (~df_prov['atleta_id'].isin(time_ideal['atleta_id'])) &
-                          (df_prov['preco_num'] <= min_preco_titular)].head(1)
-            if not res.empty:
-                reservas.append(res.iloc[0])
-        
-        st.table(pd.DataFrame(reservas)[['pos_nome', 'apelido', 'preco_num']])
+# ── Tabs principais ───────────────────────────────────────────────
+tab1, tab2, tab3, tab4 = st.tabs([
+    "🏠 Confrontos R10",
+    "🏅 Top por Posição",
+    "⚠️ Alertas",
+    "📋 Mercado Completo",
+])
 
-if __name__ == "__main__":
-    main()
+# ── TAB 1: Confrontos ─────────────────────────────────────────────
+with tab1:
+    st.subheader("📅 Confrontos da Rodada 10")
+    df_conf = get_confrontos_df()
+    st.dataframe(df_conf, use_container_width=True, hide_index=True)
+
+    st.divider()
+    st.markdown("### 🔍 Análise por Clube")
+    clubes_lista = sorted(df["Adversário"].dropna().unique().tolist())
+    clube_sel    = st.selectbox("Selecione um clube", sorted(df["Nome"].dropna().unique().tolist())[:20])
+    if clube_sel:
+        row = df[df["Nome"] == clube_sel]
+        if not row.empty:
+            r = row.iloc[0]
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Mando",     r.get("Mando","?"))
+            c2.metric("Adversário",r.get("Adversário","?"))
+            c3.metric("Favorito",  r.get("Favorito","?"))
+            c1.metric("Aprov.%",   f"{r.get('Aprov.%',0):.1f}%")
+            c2.metric("AprovAdv.%",f"{r.get('AprovAdv.%',0):.1f}%")
+            c3.metric("Data",      r.get("Data Jogo","?"))
+
+# ── TAB 2: Top por Posição ────────────────────────────────────────
+with tab2:
+    st.subheader("🏅 Melhores por Posição — Score Mitada")
+    posicoes = ["Goleiro","Lateral","Zagueiro","Meia","Atacante","Técnico"]
+    cols_show = ["Nome","Status","Preço","Média","Variação","CB",
+                 "Score Mitada","Mando","Adversário","Favorito","Scouts"]
+
+    for pos in posicoes:
+        subset = df[df["Posição"] == pos].copy()
+        if subset.empty:
+            continue
+        subset = subset.sort_values("Score Mitada", ascending=False).head(8)
+        cols_ok = [c for c in cols_show if c in subset.columns]
+
+        emoji = {"Goleiro":"🧤","Lateral":"🛡️","Zagueiro":"🛡️",
+                 "Meia":"🎯","Atacante":"⚡","Técnico":"📋"}.get(pos,"")
+        with st.expander(f"{emoji} {pos} — Top {len(subset)}", expanded=(pos=="Atacante")):
+            st.dataframe(
+                subset[cols_ok].reset_index(drop=True),
+                use_container_width=True, hide_index=True,
+            )
+
+# ── TAB 3: Alertas ────────────────────────────────────────────────
+with tab3:
+    st.subheader("⚠️ Dashboard de Alertas")
+
+    alertas = gerar_alertas(df)
+    res     = resumo_alertas(alertas)
+
+    a1, a2, a3, a4 = st.columns(4)
+    a1.metric("🔴 Danger",  res["danger"])
+    a2.metric("🟡 Warning", res["warning"])
+    a3.metric("🔵 Info",    res["info"])
+    a4.metric("📊 Total",   res["total"])
+    st.divider()
+
+    filtro_nivel = st.multiselect(
+        "Filtrar por nível",
+        ["danger","warning","info"],
+        default=["danger","warning"],
+    )
+    filtro_tipo = st.multiselect(
+        "Filtrar por tipo",
+        sorted(set(a["tipo"] for a in alertas)),
+        default=[],
+    )
+
+    for alerta in alertas:
+        if alerta["nivel"] not in filtro_nivel:
+            continue
+        if filtro_tipo and alerta["tipo"] not in filtro_tipo:
+            continue
+        css_class = f"alerta-{alerta['nivel']}"
+        st.markdown(
+            f'<div class="{css_class}">'
+            f'<strong>[{alerta["tipo"]}] {alerta["jogador"]}</strong>'
+            f' — {alerta["mensagem"]}'
+            f'</div>',
+            unsafe_allow_html=True
+        )
+
+# ── TAB 4: Mercado Completo ───────────────────────────────────────
+with tab4:
+    st.subheader("📋 Mercado Completo — Filtros Avançados")
+
+    col_f1, col_f2, col_f3 = st.columns(3)
+    with col_f1:
+        pos_filtro = st.multiselect("Posição", ["Goleiro","Lateral","Zagueiro","Meia","Atacante","Técnico"])
+    with col_f2:
+        preco_max  = st.slider("Preço máximo (C$)", 0.0, 50.0, float(orcamento), 0.5)
+    with col_f3:
+        mando_fil  = st.multiselect("Mando", ["🏠 Casa","✈️ Fora"])
+
+    df_mercado = df.copy()
+    if pos_filtro:
+        df_mercado = df_mercado[df_mercado["Posição"].isin(pos_filtro)]
+    df_mercado = df_mercado[df_mercado["Preço"] <= preco_max]
+    if mando_fil:
+        df_mercado = df_mercado[df_mercado["Mando"].isin(mando_fil)]
+
+    cols_mercado = ["Nome","Posição","Status","Preço","Média","Variação",
+                    "CB","Score Mitada","Mando","Adversário","Favorito","Jogos","Scouts"]
+    cols_ok = [c for c in cols_mercado if c in df_mercado.columns]
+
+    st.dataframe(
+        df_mercado[cols_ok].reset_index(drop=True),
+        use_container_width=True, hide_index=True,
+    )
+    st.caption(f"Exibindo {len(df_mercado)} jogadores")
