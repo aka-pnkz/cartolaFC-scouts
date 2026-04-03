@@ -1,74 +1,301 @@
 import streamlit as st
 import pandas as pd
 import requests
-import datetime
+import plotly.graph_objects as go
+import plotly.express as px
 from datetime import datetime, timezone
 
-# --- CONFIGURAÇÃO DA PÁGINA ---
-st.set_page_config(page_title="MITAR-BOT PRO | Live Status", page_icon="⏰", layout="wide")
+# ============================================================
+# CONFIGURAÇÃO DA PÁGINA
+# ============================================================
+st.set_page_config(
+    page_title="MITAR-BOT 2026 | Pro Dashboard",
+    page_icon="⚽",
+    layout="wide"
+)
 
-# --- CAMADA DE DADOS ---
-def get_live_data():
-    # Removendo cache para garantir dados de status em tempo real no fechamento
-    mercado = requests.get("https://api.cartola.globo.com/atletas/mercado").json()
-    partidas = requests.get("https://api.cartola.globo.com/partidas").json()
-    status_mercado = requests.get("https://api.cartola.globo.com/mercado/status").json()
-    return mercado, partidas, status_mercado
+st.markdown("""
+    <style>
+    [data-testid="stMetricValue"] { font-size: 22px; color: #1a73e8; }
+    </style>
+""", unsafe_allow_html=True)
 
-# --- UI DE FECHAMENTO (SIDEBAR) ---
+# ============================================================
+# CAMADA DE DADOS
+# ============================================================
+@st.cache_data(ttl=600)
+def get_all_data():
+    try:
+        mercado  = requests.get("https://api.cartola.globo.com/atletas/mercado").json()
+        partidas = requests.get("https://api.cartola.globo.com/partidas").json()
+        status   = requests.get("https://api.cartola.globo.com/mercado/status").json()
+        return mercado, partidas, status
+    except Exception as e:
+        st.error(f"Erro na API: {e}")
+        return None, None, None
+
+# ============================================================
+# CAMADA DE INTELIGÊNCIA
+# ============================================================
+def process_data(mercado_raw, partidas_raw):
+    atletas  = mercado_raw['atletas']
+    clubes   = mercado_raw['clubes']
+    posicoes = mercado_raw['posicoes']
+    df = pd.DataFrame(atletas)
+
+    # Mapeamento de Confrontos (Varrendo Partidas)
+    confrontos_map = {}
+    for p in partidas_raw['partidas']:
+        c_id = p['clube_casa_id']
+        v_id = p['clube_visitante_id']
+        c_pos = p['clube_casa_posicao']
+        v_pos = p['clube_visitante_posicao']
+        confrontos_map[c_id] = {
+            'vs': clubes[str(v_id)]['nome'],
+            'vs_pos': v_pos,
+            'mando': '🏠 Casa'
+        }
+        confrontos_map[v_id] = {
+            'vs': clubes[str(c_id)]['nome'],
+            'vs_pos': c_pos,
+            'mando': '✈️ Fora'
+        }
+
+    # Colunas de contexto
+    df['clube_nome']  = df['clube_id'].apply(lambda x: clubes[str(x)]['nome'])
+    df['escudo']      = df['clube_id'].apply(lambda x: clubes[str(x)]['escudos']['60x60'])
+    df['pos_nome']    = df['posicao_id'].apply(lambda x: posicoes[str(x)]['abreviacao'].upper())
+    df['adversario']  = df['clube_id'].apply(lambda x: confrontos_map.get(x, {}).get('vs', 'N/A'))
+    df['adv_pos']     = df['clube_id'].apply(lambda x: confrontos_map.get(x, {}).get('vs_pos', 10))
+    df['mando']       = df['clube_id'].apply(lambda x: confrontos_map.get(x, {}).get('mando', 'N/A'))
+    df['foto']        = df['foto'].str.replace('FORMATO', '140x140', regex=False)
+
+    # Extração de Scouts
+    def get_s(s_dict, key):
+        return s_dict.get(key, 0) if isinstance(s_dict, dict) else 0
+
+    for s in ['DS', 'G', 'A', 'DE', 'SG', 'FD', 'FF', 'FS']:
+        df[s] = df['scout'].apply(lambda x: get_s(x, s))
+
+    # Meta de valorização
+    df['meta_pontos'] = (df['preco_num'] * 0.45).round(2)
+
+    # Score de Mitada com Cedência
+    def calc_score(row):
+        if row['pos_nome'] == 'GOL':
+            score = (row['DE'] * 1.5) + (row['media_num'] * 2)
+        elif row['pos_nome'] in ['LAT', 'ZAG']:
+            score = (row['DS'] * 1.2) + (row['SG'] * 5) + (row['media_num'] * 1.5)
+        elif row['pos_nome'] == 'MEI':
+            score = (row['DS'] * 1.0) + (row['A'] * 5) + (row['media_num'] * 2)
+        elif row['pos_nome'] == 'ATA':
+            score = (row['G'] * 8) + (row['FD'] * 1.2) + (row['FF'] * 0.8) + (row['media_num'] * 2)
+        elif row['pos_nome'] == 'TEC':
+            score = row['media_num'] * 3
+        else:
+            score = 0
+
+        # Bônus Mando
+        if row['mando'] == '🏠 Casa':
+            score *= 1.10
+
+        # Bônus Cedência (Posição do Adversário)
+        if row['adv_pos'] >= 17:
+            score *= 1.25
+        elif row['adv_pos'] >= 12:
+            score *= 1.10
+
+        return round(score, 2)
+
+    df['score_mitada'] = df.apply(calc_score, axis=1)
+    return df, partidas_raw['partidas']
+
+# ============================================================
+# OTIMIZADOR DE ESCALAÇÃO
+# ============================================================
+def optimize_team(df_pool, budget, formation):
+    configs = {
+        "4-3-3": {'GOL': 1, 'LAT': 2, 'ZAG': 2, 'MEI': 3, 'ATA': 3, 'TEC': 1},
+        "3-4-3": {'GOL': 1, 'LAT': 0, 'ZAG': 3, 'MEI': 4, 'ATA': 3, 'TEC': 1},
+        "4-4-2": {'GOL': 1, 'LAT': 2, 'ZAG': 2, 'MEI': 4, 'ATA': 2, 'TEC': 1}
+    }
+    config = configs.get(formation, configs["4-3-3"])
+    selected = []
+    cost = 0.0
+
+    for pos, qtd in config.items():
+        if qtd == 0:
+            continue
+        top = (df_pool[df_pool['pos_nome'] == pos]
+               .sort_values('score_mitada', ascending=False)
+               .head(qtd))
+        for _, row in top.iterrows():
+            selected.append(row)
+            cost += row['preco_num']
+
+    res_df = pd.DataFrame(selected).reset_index(drop=True)
+
+    # Ajuste de Orçamento
+    max_iter = 30
+    iterations = 0
+    while cost > budget and iterations < max_iter:
+        iterations += 1
+        res_df = res_df.sort_values('preco_num', ascending=False).reset_index(drop=True)
+        swapped = False
+        for i in range(len(res_df)):
+            pos   = res_df.loc[i, 'pos_nome']
+            price = res_df.loc[i, 'preco_num']
+            aid   = res_df.loc[i, 'atleta_id']
+
+            sub = df_pool[
+                (df_pool['pos_nome'] == pos) &
+                (df_pool['preco_num'] < price) &
+                (~df_pool['atleta_id'].isin(res_df['atleta_id']))
+            ].sort_values('score_mitada', ascending=False).head(1)
+
+            if not sub.empty:
+                cost = cost - price + sub.iloc[0]['preco_num']
+                res_df = res_df.drop(i).reset_index(drop=True)
+                res_df = pd.concat([res_df, sub], ignore_index=True)
+                swapped = True
+                break
+
+        if not swapped:
+            break
+
+    return res_df, round(cost, 2)
+
+# ============================================================
+# STATUS DO MERCADO
+# ============================================================
 def show_market_status(status_raw):
     st.sidebar.markdown("---")
-    st.sidebar.subheader("⏳ Status do Mercado")
-    
-    # Extrair data de fechamento do JSON
-    # Exemplo: status_raw['fechamento'] = {'dia': 4, 'mes': 4, 'ano': 2026, 'hora': 18, 'minuto': 0}
-    f = status_raw['fechamento']
-    data_fechamento = datetime(f['ano'], f['mes'], f['dia'], f['hora'], f['minuto'], tzinfo=timezone.utc)
-    agora = datetime.now(timezone.utc)
-    
-    restante = data_fechamento - agora
-    
-    if restante.total_seconds() > 0:
-        horas, rem = divmod(restante.seconds, 3600)
-        minutos, _ = divmod(rem, 60)
-        st.sidebar.error(f"Mercado fecha em: {restante.days}d {horas}h {minutos}min")
-    else:
-        st.sidebar.warning("🚫 MERCADO FECHADO!")
+    st.sidebar.subheader("⏳ Mercado")
+    try:
+        f = status_raw.get('fechamento', {})
+        data_fechamento = datetime(
+            f.get('ano', 2026),
+            f.get('mes', 4),
+            f.get('dia', 5),
+            f.get('hora', 18),
+            f.get('minuto', 0),
+            tzinfo=timezone.utc
+        )
+        agora    = datetime.now(timezone.utc)
+        restante = data_fechamento - agora
+        if restante.total_seconds() > 0:
+            horas, rem   = divmod(int(restante.total_seconds()), 3600)
+            minutos, _   = divmod(rem, 60)
+            st.sidebar.success(f"✅ Aberto — Fecha em {horas}h {minutos}min")
+        else:
+            st.sidebar.error("🚫 MERCADO FECHADO")
+    except:
+        st.sidebar.info("Status do mercado indisponível.")
 
-# --- APP PRINCIPAL ---
+# ============================================================
+# BANCO DE RESERVAS
+# ============================================================
+def get_bench(df_pool, time_ideal):
+    reservas = []
+    posicoes_no_time = time_ideal['pos_nome'].unique()
+    for pos in ['GOL', 'LAT', 'ZAG', 'MEI', 'ATA']:
+        if pos not in posicoes_no_time:
+            continue
+        min_p = time_ideal[time_ideal['pos_nome'] == pos]['preco_num'].min()
+        res = df_pool[
+            (df_pool['pos_nome'] == pos) &
+            (~df_pool['atleta_id'].isin(time_ideal['atleta_id'])) &
+            (df_pool['preco_num'] <= min_p)
+        ].sort_values('score_mitada', ascending=False).head(1)
+        if not res.empty:
+            reservas.append(res.iloc[0])
+    return pd.DataFrame(reservas)
+
+# ============================================================
+# FUNÇÃO PRINCIPAL
+# ============================================================
 def main():
-    st.title("⚽ MITAR-BOT PRO | Live Monitor")
-    
-    # Botão de Atualização Manual
-    if st.sidebar.button("🔄 Atualizar Dados Agora"):
+    # Sidebar
+    st.sidebar.title("⚙️ MITAR-BOT CONFIG")
+    saldo    = st.sidebar.number_input("💰 Saldo (Cartoletas):", value=122.28, step=1.0)
+    formacao = st.sidebar.selectbox("🏟️ Formação:", ["4-3-3", "4-4-2", "3-4-3"])
+    min_jog  = st.sidebar.slider("🏃 Mín. Jogos:", 0, 10, 3)
+
+    if st.sidebar.button("🔄 Atualizar Dados"):
         st.cache_data.clear()
         st.rerun()
 
-    mercado, partidas_raw, status_mercado = get_live_data()
-    show_market_status(status_mercado)
+    st.title("⚽ MITAR-BOT 2026 | Pro Dashboard")
 
-    # ... (Lógica de processamento anterior aqui) ...
-    # Supondo que 'time_ideal' foi gerado pela lógica anterior
-    
-    st.header("🏆 Seu Time Ideal")
-    
-    # --- NOVO: CHECK DE INTEGRIDADE ---
-    # Simulando um check se algum jogador mudou de status
-    status_critico = False
-    for _, player in time_ideal.iterrows():
-        if player['status_id'] != 7: # 7 = Provável
-            st.error(f"🚨 ALERTA: {player['apelido']} não é mais PROVÁVEL! Status atual: {player['status_id']}")
-            status_critico = True
-    
-    if not status_critico:
-        st.success("✅ Todos os jogadores sugeridos estão confirmados como Prováveis.")
+    # Carregar Dados
+    mercado_raw, partidas_raw, status_raw = get_all_data()
+    if not mercado_raw:
+        st.stop()
 
-    # Exibir a Tabela Pro
-    st.dataframe(time_ideal[['foto', 'apelido', 'clube_nome', 'status_id', 'score_mitada']],
-                 column_config={
-                     "foto": st.column_config.ImageColumn("Atleta"),
-                     "status_id": st.column_config.NumberColumn("Status", help="7 = Provável")
-                 }, use_container_width=True, hide_index=True)
+    show_market_status(status_raw)
 
-if __name__ == "__main__":
-    main()
+    # Processar Dados
+    df, partidas = process_data(mercado_raw, partidas_raw)
+    df_prov = df[(df['status_id'] == 7) & (df['jogos_num'] >= min_jog)]
+
+    # Gerar Time Ideal
+    time_ideal, custo_final = optimize_team(df_prov, saldo, formacao)
+    capitao = time_ideal.sort_values('score_mitada', ascending=False).iloc[0]
+
+    # ============================
+    # ABAS PRINCIPAIS
+    # ============================
+    tab1, tab2, tab3, tab4 = st.tabs([
+        "🏆 Time Ideal",
+        "📊 Comparador",
+        "🏟️ Cedentes",
+        "🚨 Monitor"
+    ])
+
+    # --- ABA 1: TIME IDEAL ---
+    with tab1:
+        # Card do Capitão
+        ca, cb, cc = st.columns([1, 2, 2])
+        with ca:
+            st.image(capitao['foto'], width=120)
+        with cb:
+            st.subheader(f"💎 {capitao['apelido']}")
+            st.write(f"**Clube:** {capitao['clube_nome']}")
+            st.write(f"**Confronto:** vs {capitao['adversario']} {capitao['mando']}")
+            st.write(f"**Meta Valorizar:** {capitao['meta_pontos']} pts")
+        with cc:
+            st.metric("Média", f"{capitao['media_num']:.2f}")
+            st.metric("Score Mitada", f"{capitao['score_mitada']}")
+            st.metric("Preço", f"C$ {capitao['preco_num']:.2f}")
+
+        st.markdown("---")
+        st.subheader(f"Escalação {formacao} — Custo: C$ {custo_final:.2f} | Saldo restante: C$ {saldo - custo_final:.2f}")
+        st.dataframe(
+            time_ideal[[
+                'foto', 'pos_nome', 'apelido', 'escudo',
+                'adversario', 'mando', 'media_num',
+                'meta_pontos', 'score_mitada', 'preco_num'
+            ]],
+            column_config={
+                "foto":         st.column_config.ImageColumn("Atleta"),
+                "escudo":       st.column_config.ImageColumn("Clube"),
+                "pos_nome":     "Posição",
+                "apelido":      "Jogador",
+                "adversario":   "Adversário",
+                "mando":        "Mando",
+                "media_num":    "Média",
+                "meta_pontos":  "Meta Valor.",
+                "score_mitada": st.column_config.ProgressColumn("Score", min_value=0, max_value=80),
+                "preco_num":    "Preço (C$)"
+            },
+            use_container_width=True,
+            hide_index=True
+        )
+
+        # Banco de Reservas
+        st.markdown("---")
+        st.subheader("🔄 Banco de Reservas")
+        bench = get_bench(df_prov, time_ideal)
+        if not bench.empty:
+            st.dataframe(
+                bench
