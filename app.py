@@ -43,44 +43,32 @@ def process_data(mercado_raw, partidas_raw):
     posicoes = mercado_raw['posicoes']
     df = pd.DataFrame(atletas)
 
-    # Mapeamento de Confrontos (Varrendo Partidas)
+    # Mapeamento de Confrontos
     confrontos_map = {}
     for p in partidas_raw['partidas']:
-        c_id = p['clube_casa_id']
-        v_id = p['clube_visitante_id']
+        c_id  = p['clube_casa_id']
+        v_id  = p['clube_visitante_id']
         c_pos = p['clube_casa_posicao']
         v_pos = p['clube_visitante_posicao']
-        confrontos_map[c_id] = {
-            'vs': clubes[str(v_id)]['nome'],
-            'vs_pos': v_pos,
-            'mando': '🏠 Casa'
-        }
-        confrontos_map[v_id] = {
-            'vs': clubes[str(c_id)]['nome'],
-            'vs_pos': c_pos,
-            'mando': '✈️ Fora'
-        }
+        confrontos_map[c_id] = {'vs': clubes[str(v_id)]['nome'], 'vs_pos': v_pos, 'mando': '🏠 Casa'}
+        confrontos_map[v_id] = {'vs': clubes[str(c_id)]['nome'], 'vs_pos': c_pos, 'mando': '✈️ Fora'}
 
-    # Colunas de contexto
-    df['clube_nome']  = df['clube_id'].apply(lambda x: clubes[str(x)]['nome'])
-    df['escudo']      = df['clube_id'].apply(lambda x: clubes[str(x)]['escudos']['60x60'])
-    df['pos_nome']    = df['posicao_id'].apply(lambda x: posicoes[str(x)]['abreviacao'].upper())
-    df['adversario']  = df['clube_id'].apply(lambda x: confrontos_map.get(x, {}).get('vs', 'N/A'))
-    df['adv_pos']     = df['clube_id'].apply(lambda x: confrontos_map.get(x, {}).get('vs_pos', 10))
-    df['mando']       = df['clube_id'].apply(lambda x: confrontos_map.get(x, {}).get('mando', 'N/A'))
-    df['foto']        = df['foto'].str.replace('FORMATO', '140x140', regex=False)
+    df['clube_nome'] = df['clube_id'].apply(lambda x: clubes[str(x)]['nome'])
+    df['escudo']     = df['clube_id'].apply(lambda x: clubes[str(x)]['escudos']['60x60'])
+    df['pos_nome']   = df['posicao_id'].apply(lambda x: posicoes[str(x)]['abreviacao'].upper())
+    df['adversario'] = df['clube_id'].apply(lambda x: confrontos_map.get(x, {}).get('vs', 'N/A'))
+    df['adv_pos']    = df['clube_id'].apply(lambda x: confrontos_map.get(x, {}).get('vs_pos', 10))
+    df['mando']      = df['clube_id'].apply(lambda x: confrontos_map.get(x, {}).get('mando', 'N/A'))
+    df['foto']       = df['foto'].str.replace('FORMATO', '140x140', regex=False)
 
-    # Extração de Scouts
     def get_s(s_dict, key):
         return s_dict.get(key, 0) if isinstance(s_dict, dict) else 0
 
     for s in ['DS', 'G', 'A', 'DE', 'SG', 'FD', 'FF', 'FS']:
         df[s] = df['scout'].apply(lambda x: get_s(x, s))
 
-    # Meta de valorização
     df['meta_pontos'] = (df['preco_num'] * 0.45).round(2)
 
-    # Score de Mitada com Cedência
     def calc_score(row):
         if row['pos_nome'] == 'GOL':
             score = (row['DE'] * 1.5) + (row['media_num'] * 2)
@@ -95,11 +83,8 @@ def process_data(mercado_raw, partidas_raw):
         else:
             score = 0
 
-        # Bônus Mando
         if row['mando'] == '🏠 Casa':
             score *= 1.10
-
-        # Bônus Cedência (Posição do Adversário)
         if row['adv_pos'] >= 17:
             score *= 1.25
         elif row['adv_pos'] >= 12:
@@ -135,8 +120,7 @@ def optimize_team(df_pool, budget, formation):
 
     res_df = pd.DataFrame(selected).reset_index(drop=True)
 
-    # Ajuste de Orçamento
-    max_iter = 30
+    max_iter = 50
     iterations = 0
     while cost > budget and iterations < max_iter:
         iterations += 1
@@ -145,7 +129,6 @@ def optimize_team(df_pool, budget, formation):
         for i in range(len(res_df)):
             pos   = res_df.loc[i, 'pos_nome']
             price = res_df.loc[i, 'preco_num']
-            aid   = res_df.loc[i, 'atleta_id']
 
             sub = df_pool[
                 (df_pool['pos_nome'] == pos) &
@@ -166,33 +149,6 @@ def optimize_team(df_pool, budget, formation):
     return res_df, round(cost, 2)
 
 # ============================================================
-# STATUS DO MERCADO
-# ============================================================
-def show_market_status(status_raw):
-    st.sidebar.markdown("---")
-    st.sidebar.subheader("⏳ Mercado")
-    try:
-        f = status_raw.get('fechamento', {})
-        data_fechamento = datetime(
-            f.get('ano', 2026),
-            f.get('mes', 4),
-            f.get('dia', 5),
-            f.get('hora', 18),
-            f.get('minuto', 0),
-            tzinfo=timezone.utc
-        )
-        agora    = datetime.now(timezone.utc)
-        restante = data_fechamento - agora
-        if restante.total_seconds() > 0:
-            horas, rem   = divmod(int(restante.total_seconds()), 3600)
-            minutos, _   = divmod(rem, 60)
-            st.sidebar.success(f"✅ Aberto — Fecha em {horas}h {minutos}min")
-        else:
-            st.sidebar.error("🚫 MERCADO FECHADO")
-    except:
-        st.sidebar.info("Status do mercado indisponível.")
-
-# ============================================================
 # BANCO DE RESERVAS
 # ============================================================
 def get_bench(df_pool, time_ideal):
@@ -209,17 +165,42 @@ def get_bench(df_pool, time_ideal):
         ].sort_values('score_mitada', ascending=False).head(1)
         if not res.empty:
             reservas.append(res.iloc[0])
-    return pd.DataFrame(reservas)
+    return pd.DataFrame(reservas).reset_index(drop=True)
+
+# ============================================================
+# STATUS DO MERCADO
+# ============================================================
+def show_market_status(status_raw):
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("⏳ Mercado")
+    try:
+        f = status_raw.get('fechamento', {})
+        data_fechamento = datetime(
+            f.get('ano', 2026), f.get('mes', 4),
+            f.get('dia', 5),   f.get('hora', 18),
+            f.get('minuto', 0), tzinfo=timezone.utc
+        )
+        agora    = datetime.now(timezone.utc)
+        restante = data_fechamento - agora
+        if restante.total_seconds() > 0:
+            horas, rem = divmod(int(restante.total_seconds()), 3600)
+            minutos, _ = divmod(rem, 60)
+            st.sidebar.success(f"✅ Aberto — Fecha em {horas}h {minutos}min")
+        else:
+            st.sidebar.error("🚫 MERCADO FECHADO")
+    except:
+        st.sidebar.info("Status indisponível.")
 
 # ============================================================
 # FUNÇÃO PRINCIPAL
 # ============================================================
 def main():
-    # Sidebar
+
+    # --- SIDEBAR ---
     st.sidebar.title("⚙️ MITAR-BOT CONFIG")
     saldo    = st.sidebar.number_input("💰 Saldo (Cartoletas):", value=122.28, step=1.0)
     formacao = st.sidebar.selectbox("🏟️ Formação:", ["4-3-3", "4-4-2", "3-4-3"])
-    min_jog  = st.sidebar.slider("🏃 Mín. Jogos:", 0, 10, 3)
+    min_jog  = st.sidebar.slider("🏃 Mín. de Jogos:", 0, 10, 3)
 
     if st.sidebar.button("🔄 Atualizar Dados"):
         st.cache_data.clear()
@@ -227,24 +208,20 @@ def main():
 
     st.title("⚽ MITAR-BOT 2026 | Pro Dashboard")
 
-    # Carregar Dados
+    # --- DADOS ---
     mercado_raw, partidas_raw, status_raw = get_all_data()
     if not mercado_raw:
         st.stop()
 
     show_market_status(status_raw)
 
-    # Processar Dados
     df, partidas = process_data(mercado_raw, partidas_raw)
     df_prov = df[(df['status_id'] == 7) & (df['jogos_num'] >= min_jog)]
 
-    # Gerar Time Ideal
     time_ideal, custo_final = optimize_team(df_prov, saldo, formacao)
     capitao = time_ideal.sort_values('score_mitada', ascending=False).iloc[0]
 
-    # ============================
-    # ABAS PRINCIPAIS
-    # ============================
+    # --- ABAS ---
     tab1, tab2, tab3, tab4 = st.tabs([
         "🏆 Time Ideal",
         "📊 Comparador",
@@ -252,16 +229,17 @@ def main():
         "🚨 Monitor"
     ])
 
-    # --- ABA 1: TIME IDEAL ---
+    # ========================
+    # ABA 1: TIME IDEAL
+    # ========================
     with tab1:
-        # Card do Capitão
         ca, cb, cc = st.columns([1, 2, 2])
         with ca:
             st.image(capitao['foto'], width=120)
         with cb:
             st.subheader(f"💎 {capitao['apelido']}")
             st.write(f"**Clube:** {capitao['clube_nome']}")
-            st.write(f"**Confronto:** vs {capitao['adversario']} {capitao['mando']}")
+            st.write(f"**vs** {capitao['adversario']} {capitao['mando']}")
             st.write(f"**Meta Valorizar:** {capitao['meta_pontos']} pts")
         with cc:
             st.metric("Média", f"{capitao['media_num']:.2f}")
@@ -269,7 +247,9 @@ def main():
             st.metric("Preço", f"C$ {capitao['preco_num']:.2f}")
 
         st.markdown("---")
-        st.subheader(f"Escalação {formacao} — Custo: C$ {custo_final:.2f} | Saldo restante: C$ {saldo - custo_final:.2f}")
+        saldo_restante = round(saldo - custo_final, 2)
+        st.subheader(f"Escalação {formacao} — C$ {custo_final:.2f} | Sobra: C$ {saldo_restante}")
+
         st.dataframe(
             time_ideal[[
                 'foto', 'pos_nome', 'apelido', 'escudo',
@@ -279,23 +259,41 @@ def main():
             column_config={
                 "foto":         st.column_config.ImageColumn("Atleta"),
                 "escudo":       st.column_config.ImageColumn("Clube"),
-                "pos_nome":     "Posição",
+                "pos_nome":     "Pos",
                 "apelido":      "Jogador",
                 "adversario":   "Adversário",
                 "mando":        "Mando",
                 "media_num":    "Média",
-                "meta_pontos":  "Meta Valor.",
-                "score_mitada": st.column_config.ProgressColumn("Score", min_value=0, max_value=80),
-                "preco_num":    "Preço (C$)"
+                "meta_pontos":  "Meta Val.",
+                "score_mitada": st.column_config.ProgressColumn("Score Mitada", min_value=0, max_value=100),
+                "preco_num":    "C$"
             },
             use_container_width=True,
             hide_index=True
         )
 
-        # Banco de Reservas
         st.markdown("---")
         st.subheader("🔄 Banco de Reservas")
         bench = get_bench(df_prov, time_ideal)
         if not bench.empty:
             st.dataframe(
-                bench
+                bench[['pos_nome', 'apelido', 'clube_nome', 'preco_num', 'score_mitada']],
+                column_config={
+                    "pos_nome":     "Pos",
+                    "apelido":      "Reserva",
+                    "clube_nome":   "Clube",
+                    "preco_num":    "C$",
+                    "score_mitada": "Score"
+                },
+                use_container_width=True,
+                hide_index=True
+            )
+
+    # ========================
+    # ABA 2: COMPARADOR
+    # ========================
+    with tab2:
+        st.subheader("📊 Comparador Head-to-Head")
+        c1, c2 = st.columns(2)
+        with c1:
+            p1_nome
