@@ -1,59 +1,55 @@
 # utils/score_mitada.py
 import pandas as pd
-import numpy as np
-from utils.scouts import calcular_score_scout, calcular_custo_beneficio
-from utils.confrontos import get_forca_confronto, get_clubes_em_casa
+from utils.confrontos import get_clubes_em_casa, get_info_clube
 
-POSICAO_MAP = {1: "Goleiro", 2: "Lateral", 3: "Zagueiro", 4: "Meia", 5: "Atacante", 6: "Técnico"}
+POSICAO_MAP  = {1:"Goleiro", 2:"Lateral", 3:"Zagueiro", 4:"Meia", 5:"Atacante", 6:"Técnico"}
+STATUS_LABEL = {1:"🟢 Provável", 2:"🔴 Dúvida", 3:"⚫ Suspenso",
+                5:"🟡 Contundido", 6:"⚪ Nulo", 7:"🟢 Provável"}
 
-STATUS_LABEL = {
-    1: "🟢 Provável",
-    2: "🔴 Dúvida",
-    3: "⚫ Suspenso",
-    5: "🟡 Contundido",
-    6: "⚪ Nulo",
-    7: "🟢 Provável",
+SCOUTS_POS = {
+    1: {"G":8,"DE":3,"DD":3,"SG":5,"GS":-3,"DP":7,"FC":-0.5,"CA":-1.5},
+    2: {"G":8,"A":5,"RB":1.5,"I":1,"FS":0.5,"SG":3,"FC":-0.5,"CA":-1.5},
+    3: {"G":8,"A":4,"RB":1.5,"I":1,"SG":4,"FC":-0.5,"CA":-1.5,"DE":2},
+    4: {"G":8,"A":7,"FD":1.2,"FF":0.8,"FS":0.8,"RB":1.5,"I":1,"FC":-0.5,"CA":-1.5},
+    5: {"G":10,"A":6,"FD":1.2,"FF":0.8,"FS":0.8,"FC":-0.5,"CA":-1.5},
+    6: {"G":6,"A":4,"SG":3,"FC":-0.3,"CA":-1},
 }
 
-def calcular_score_mitada(atleta: dict, jogos_min: int = 3) -> float:
-    """
-    Score Mitada = combinação ponderada de:
-    - Média ponderada (40%)
-    - Custo-benefício (20%)
-    - Variação (15%)
-    - Scout score (15%)
-    - Bônus de mando (10%)
-    """
-    media       = atleta.get("media_num", 0) or 0
-    variacao    = atleta.get("variacao_num", 0) or 0
-    preco       = atleta.get("preco_num", 1) or 1
-    jogos       = atleta.get("jogos_num", 0) or 0
-    clube_id    = atleta.get("clube_id", 0)
-    status      = atleta.get("status_id", 0)
+def _scout_score(atleta: dict) -> float:
+    scouts = atleta.get("scout", {}) or {}
+    pesos  = SCOUTS_POS.get(atleta.get("posicao_id", 4), SCOUTS_POS[4])
+    return round(sum((scouts.get(k, 0) or 0) * v for k, v in pesos.items()), 2)
 
-    if jogos < jogos_min or status not in [1, 7]:
+def _cb(atleta: dict) -> float:
+    media = atleta.get("media_num", 0) or 0
+    preco = atleta.get("preco_num", 1) or 1
+    return round(media / preco, 3) if preco else 0.0
+
+def calcular_score_mitada(atleta: dict) -> float:
+    """
+    Score Mitada = ponderação de 5 fatores:
+    Média(40%) + CB(20%) + Variação(15%) + Scouts/Jogos(15%) + Bônus Mando(10%)
+    Retorna 0.0 se status não for Provável ou jogos < 3.
+    """
+    status = atleta.get("status_id", 0)
+    jogos  = atleta.get("jogos_num", 0) or 0
+    if status not in [1, 7] or jogos < 3:
         return 0.0
 
-    cb          = calcular_custo_beneficio(atleta)
-    scout_score = calcular_score_scout(atleta)
-    clubes_casa = get_clubes_em_casa()
-    bonus_mando = 1.0 if clube_id in clubes_casa else 0.0
+    media    = atleta.get("media_num", 0) or 0
+    variacao = atleta.get("variacao_num", 0) or 0
+    clube_id = atleta.get("clube_id", 0)
+    cb       = _cb(atleta)
+    sc       = _scout_score(atleta) / max(jogos, 1)
+    mando    = 0.5 if clube_id in get_clubes_em_casa() else 0.0
 
-    score = (
-        media       * 0.40 +
-        cb          * 0.20 +
-        variacao    * 0.15 +
-        (scout_score / max(jogos, 1)) * 0.15 +
-        bonus_mando * 0.10
-    )
-    return round(max(score, 0), 3)
+    score = (media * 0.40 + cb * 0.20 + variacao * 0.15 + sc * 0.15 + mando * 0.10)
+    return round(max(score, 0.0), 3)
 
-def enriquecer_dataframe(atletas_raw: list) -> pd.DataFrame:
-    """
-    Converte lista de atletas da API em DataFrame enriquecido
-    com Score Mitada, custo-benefício, confronto e status label.
-    """
+def enriquecer_df(atletas_raw: list) -> pd.DataFrame:
+    """Converte lista da API em DataFrame completo com Score Mitada."""
     rows = []
+    clubes_casa = get_clubes_em_casa()
     for a in atletas_raw:
         clube_id  = a.get("clube_id", 0)
         pos_id    = a.get("posicao_id", 0)
@@ -63,36 +59,6 @@ def enriquecer_dataframe(atletas_raw: list) -> pd.DataFrame:
         variacao  = a.get("variacao_num", 0) or 0
         jogos     = a.get("jogos_num", 0) or 0
 
-        clubes_casa = get_clubes_em_casa()
-        eh_mandante = clube_id in clubes_casa
-
-        # Tenta buscar dados do confronto (casa ou fora)
-        confronto   = get_forca_confronto(clube_id, eh_mandante)
-        if not confronto:
-            confronto = get_forca_confronto(clube_id, not eh_mandante)
-
-        score_mitada = calcular_score_mitada(a)
-        cb           = calcular_custo_beneficio(a)
-
-        rows.append({
-            "atleta_id":      a.get("atleta_id"),
-            "Nome":           a.get("apelido", a.get("nome", "?")),
-            "Clube":          a.get("clube", {}).get("abreviacao", str(clube_id)) if isinstance(a.get("clube"), dict) else str(clube_id),
-            "clube_id":       clube_id,
-            "Posição":        POSICAO_MAP.get(pos_id, "?"),
-            "posicao_id":     pos_id,
-            "Status":         STATUS_LABEL.get(status_id, "❓"),
-            "status_id":      status_id,
-            "Preço (C$)":     preco,
-            "preco_num":      preco,
-            "Média":          media,
-            "media_num":      media,
-            "Variação":       variacao,
-            "variacao_num":   variacao,
-            "Jogos":          jogos,
-            "jogos_num":      jogos,
-            "CB Ratio":       cb,
-            "cb_ratio":       cb,
-            "Score Mitada":   score_mitada,
-            "Mando":          "🏠" if eh_mandante else "✈️",
-            "Adversário":     confronto.
+        eh_casa   = clube_id in clubes_casa
+        conf      = get_info_clube(clube_id)
+        sm        = calcular_score_mitada
